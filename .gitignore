@@ -1,0 +1,10 @@
+cleaned_data/
+my templates and documentations/
+output/
+kpi_analysis_reports/
+__pycache__/
+*.pyc
+*.csv
+*.xlsx
+.venv/
+venv/
