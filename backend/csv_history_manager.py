@@ -86,9 +86,17 @@ class CSVHistoryManager:
             available_keys = [col for col in key_cols if col in existing_df.columns and col in df.columns]
 
             if not available_keys:
+                # Use 'Date' or 'day' as fallback key
+                for col in ['Date', 'day']:
+                    if col in existing_df.columns and col in df.columns:
+                        available_keys = [col]
+                        break
+
+            if not available_keys:
+                # No key columns found, append everything (warning)
+                logger.warning(f"{sheet_name}: No key columns found, appending all {len(df)} rows")
                 combined_df = pd.concat([existing_df, df], ignore_index=True)
                 self._write_csv(sheet_name, combined_df)
-                logger.info(f"Appended {len(df)} rows to {sheet_name} (no duplicate check)")
                 return len(df), 0
 
             # Create a set of existing keys
@@ -123,6 +131,7 @@ class CSVHistoryManager:
             logger.error(f"Failed to append to {sheet_name}: {e}")
             raise
 
+        
     def update_site_row(self, row_dict):
         """Update or append a row to SiteSummary CSV."""
         if not row_dict:

@@ -28,4 +28,3 @@ also above chart i want it to be drawn by taking the last available 14 days in c
 == i want to do the same for 3G 3G_NWBH , 3G_NW_Daily and i want to do the same for 2G 2G_NWBH , 2G_NW_Daily  so in the main page dash board will be an button or link to goto table showing last day or yesterday kpis for 2,3,4G and below the table or tables are listed the line chart for last avialble 14 days for each 2,3,4 kpis as menthioned above
   
 =============================
-

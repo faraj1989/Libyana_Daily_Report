@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Libyana NPM - SFTP Downloader (FIXED - No Duplicates)
+Libyana NPM - SFTP Downloader
 Handles FTP connection, download and file organisation with duplicate prevention.
+Uses file modification time to organize files by date.
+Handles multiple CSV suffix patterns dynamically.
 """
 
 import os
@@ -69,33 +71,32 @@ class SFTPDownloader:
             self.log(f"Failed to list remote files: {e}", 'error')
             return []
 
-    def extract_date_from_filename(self, filename):
+    def get_file_date_from_mtime(self, filename):
         """
-        Extract date from filename.
+        Get the date from file modification time (mtime).
         Returns date in YYYY-MM-DD format.
         """
-        # Pattern for YYYYMMDD (8 digits)
-        match = re.search(r'(\d{8})', filename)
-        if match:
-            date_str = match.group(1)
-            try:
-                dt = datetime.strptime(date_str, '%Y%m%d')
-                return dt.strftime('%Y-%m-%d')
-            except ValueError:
-                pass
-
-        # Pattern for YYYY-MM-DD
-        match = re.search(r'(\d{4}-\d{2}-\d{2})', filename)
-        if match:
-            return match.group(1)
-
-        return None
+        try:
+            file_stat = self.sftp.stat(filename)
+            mtime = file_stat.st_mtime
+            mtime_dt = datetime.fromtimestamp(mtime)
+            result = mtime_dt.strftime('%Y-%m-%d')
+            return result
+        except Exception as e:
+            self.log(f"⚠️ Could not get mtime for {filename}: {e}")
+            return None
 
     def get_base_name_from_filename(self, filename):
         """
-        Extract the base name of the file (without timestamp).
-        Example: "PS CS Daily Traffic per site_2G_3G_4G_20260727121322-20260812105324.zip"
-                 -> "PS CS Daily Traffic per site_2G_3G_4G"
+        Extract the base name of the file (without timestamp and extension).
+
+        Examples:
+        - "234G Cell info Daily2026_20260721121337-20260813000336.zip"
+          -> "234G Cell info Daily2026"
+        - "PS CS Daily Traffic per site_2G_3G_4G_20260727121322-20260813053022.zip"
+          -> "PS CS Daily Traffic per site_2G_3G_4G"
+        - "CS Roaming users_20260813.zip"
+          -> "CS Roaming users"
         """
         # Remove extension
         name = filename.rsplit('.', 1)[0]
@@ -104,47 +105,131 @@ class SFTPDownloader:
         pattern = r'(_\d{14}-\d{14})$'
         name = re.sub(pattern, '', name)
 
-        # Remove trailing underscores
-        name = name.rstrip('_')
+        # Remove _YYYYMMDD suffix (for files like "CS Roaming users_20260813")
+        pattern = r'(_\d{8})$'
+        name = re.sub(pattern, '', name)
+
+        # Remove trailing underscores and spaces
+        name = name.rstrip('_').strip()
 
         return name
 
-    def cleanup_old_duplicates(self, folder_path, base_name, extension='.zip'):
+    def extract_csv_suffix(self, filename):
         """
-        Keep only the most recent file with the given base name.
+        Extract the suffix from CSV filename.
+        Returns the part in parentheses after the base name.
+
+        Examples:
+        - "234G Cell info Daily2026_...(2G).csv" -> "(2G)"
+        - "234G Cell info Daily2026_...(3G).csv" -> "(3G)"
+        - "234G Cell info Daily2026_...(4G).csv" -> "(4G)"
+        - "PS CS Daily Traffic per site_2G_3G_4G_...(PS Traffic 2G).csv" -> "(PS Traffic 2G)"
+        - "PS CS Daily Traffic per site_2G_3G_4G_...(PS Traffic 3G).csv" -> "(PS Traffic 3G)"
+        - "PS CS Daily Traffic per site_2G_3G_4G_...(PS Traffic 4G).csv" -> "(PS Traffic 4G)"
+        - "CS Roaming users_20260813.csv" -> None (no parentheses)
+        """
+        # Look for pattern: (something) at the end before .csv
+        match = re.search(r'\([^)]+\)\.csv$', filename)
+        if match:
+            # Return just the parentheses part (including parentheses)
+            suffix = match.group(0)[:-4]  # Remove .csv
+            return suffix
+        return None
+
+    def get_csv_identifier(self, filename):
+        """
+        Get a unique identifier for a CSV file (base_name + suffix).
+        Used to group CSV files that belong together.
+
+        Example:
+        - Base: "234G Cell info Daily2026"
+        - Suffix: "(2G)"
+        - Identifier: "234G Cell info Daily2026(2G)"
+        """
+        base = self.get_base_name_from_filename(filename)
+        suffix = self.extract_csv_suffix(filename)
+        if suffix:
+            return f"{base}{suffix}"
+        # If no suffix, use full filename (without extension)
+        return filename.rsplit('.', 1)[0]
+
+    def check_file_exists_in_zipped(self, zipped_folder, base_name):
+        """Check if a file with the same base name already exists in zipped folder."""
+        if not os.path.exists(zipped_folder):
+            return None
+
+        for existing in os.listdir(zipped_folder):
+            if existing.startswith(base_name) and existing.endswith('.zip'):
+                return os.path.join(zipped_folder, existing)
+        return None
+
+    def cleanup_old_zipped_duplicates(self, zipped_folder, base_name):
+        """
+        Keep only the most recent zip file with the given base name.
         Delete older duplicates.
         """
-        if not os.path.exists(folder_path):
-            return None
+        if not os.path.exists(zipped_folder):
+            return
 
-        # Find all files with this base name and extension
         files = []
-        for f in os.listdir(folder_path):
-            if f.startswith(base_name) and f.endswith(extension):
-                file_path = os.path.join(folder_path, f)
+        for f in os.listdir(zipped_folder):
+            if f.startswith(base_name) and f.endswith('.zip'):
+                file_path = os.path.join(zipped_folder, f)
                 files.append((file_path, os.path.getmtime(file_path)))
 
-        if not files:
-            return None
+        if len(files) <= 1:
+            return
 
         # Sort by modification time (newest first)
         files.sort(key=lambda x: x[1], reverse=True)
 
         # Keep the newest, delete the rest
-        kept_file = files[0][0]
         for file_path, _ in files[1:]:
             try:
                 os.remove(file_path)
-                self.log(f"🗑️ Deleted duplicate: {os.path.basename(file_path)}")
+                self.log(f"🗑️ Deleted duplicate zip: {os.path.basename(file_path)}")
             except Exception as e:
                 self.log(f"⚠️ Could not delete {file_path}: {e}")
 
-        return kept_file
+    def cleanup_old_csv_duplicates(self, unzipped_folder, base_name):
+        """
+        Keep only the most recent version of EACH CSV type.
+        Groups CSVs by their unique identifier (base_name + suffix).
+
+        This ensures that (2G), (3G), (4G), (PS Traffic 2G), etc.
+        are all kept separately.
+        """
+        if not os.path.exists(unzipped_folder):
+            return
+
+        # Group CSVs by their unique identifier
+        csv_groups = {}
+        for f in os.listdir(unzipped_folder):
+            if f.startswith(base_name) and f.endswith('.csv'):
+                # Get unique identifier
+                identifier = self.get_csv_identifier(f)
+                if identifier:
+                    if identifier not in csv_groups:
+                        csv_groups[identifier] = []
+                    csv_groups[identifier].append((f, os.path.getmtime(os.path.join(unzipped_folder, f))))
+
+        # For each group, keep only the newest
+        for identifier, files in csv_groups.items():
+            if len(files) <= 1:
+                continue
+            files.sort(key=lambda x: x[1], reverse=True)
+            for f, _ in files[1:]:
+                try:
+                    os.remove(os.path.join(unzipped_folder, f))
+                    self.log(f"🗑️ Deleted duplicate CSV: {f}")
+                except Exception as e:
+                    self.log(f"⚠️ Could not delete {f}: {e}")
 
     def download_and_organize(self, target_date=None):
         """
         Download and organize files from FTP.
         If target_date is specified (YYYY-MM-DD), only downloads files for that date.
+        Uses file MODIFICATION TIME for folder organization.
         """
         if not self.sftp:
             self.log("SFTP session not active.", 'error')
@@ -170,32 +255,35 @@ class SFTPDownloader:
 
         processed_count = 0
         skipped_count = 0
+        error_count = 0
 
         for fname in zip_files:
-            # Extract date from filename
-            file_date = self.extract_date_from_filename(fname)
+            # ============================================================
+            # STEP 1: Get file date from MODIFICATION TIME
+            # ============================================================
+            file_date = self.get_file_date_from_mtime(fname)
 
             if not file_date:
-                # Try to get date from file modification time
-                try:
-                    file_stat = self.sftp.stat(fname)
-                    mtime = file_stat.st_mtime
-                    mtime_dt = datetime.fromtimestamp(mtime)
-                    file_date = mtime_dt.strftime('%Y-%m-%d')
-                    self.log(f"📅 Using mtime for {fname}: {file_date}")
-                except Exception as e:
-                    self.log(f"⚠️ Could not determine date for {fname}: {e}")
-                    continue
+                self.log(f"⚠️ Could not get modification time for {fname}, skipping")
+                error_count += 1
+                continue
 
-            # Skip if target_date is specified and doesn't match
+            # ============================================================
+            # STEP 2: Check if target_date matches
+            # ============================================================
             if target_date and file_date != target_date:
                 self.log(f"⏭️ Skipping {fname} (date {file_date} != {target_date})")
                 skipped_count += 1
                 continue
 
-            # Get the base name (without timestamp)
+            # ============================================================
+            # STEP 3: Get base name (without timestamp)
+            # ============================================================
             base_name = self.get_base_name_from_filename(fname)
 
+            # ============================================================
+            # STEP 4: Create local folders
+            # ============================================================
             day_folder = os.path.join(self.local_root, file_date)
             zipped_folder = os.path.join(day_folder, 'zipped')
             unzipped_folder = os.path.join(day_folder, 'unzipped')
@@ -203,13 +291,9 @@ class SFTPDownloader:
             os.makedirs(unzipped_folder, exist_ok=True)
 
             # ============================================================
-            # CHECK FOR DUPLICATES IN ZIPPED FOLDER
+            # STEP 5: Check if zip already exists in zipped folder
             # ============================================================
-            existing_zip = None
-            for existing in os.listdir(zipped_folder):
-                if existing.startswith(base_name) and existing.endswith('.zip'):
-                    existing_zip = os.path.join(zipped_folder, existing)
-                    break
+            existing_zip = self.check_file_exists_in_zipped(zipped_folder, base_name)
 
             if existing_zip:
                 try:
@@ -217,13 +301,11 @@ class SFTPDownloader:
                     local_mtime = os.path.getmtime(existing_zip)
 
                     if remote_mtime <= local_mtime:
-                        self.log(f"⏭️ Skipping {fname} - already exists (local is newer)")
-                        # Clean up any old duplicates in unzipped folder
-                        self.cleanup_old_duplicates(unzipped_folder, base_name, '.csv')
+                        self.log(f"⏭️ Skipping {fname} - already exists in zipped (local is newer or same)")
                         skipped_count += 1
                         continue
                     else:
-                        # Remote file is newer, delete the old one
+                        # Remote is newer, delete old and download new
                         try:
                             os.remove(existing_zip)
                             self.log(f"🗑️ Removed old zip: {os.path.basename(existing_zip)}")
@@ -233,43 +315,52 @@ class SFTPDownloader:
                     self.log(f"⚠️ Could not compare files: {e}")
 
             # ============================================================
-            # DOWNLOAD THE FILE
+            # STEP 6: Download the zip file
             # ============================================================
             local_zip_path = os.path.join(zipped_folder, fname)
             self.log(f"📥 Downloading: {fname}")
-            self.log(f"   📅 Date: {file_date}")
-            self.log(f"   📁 Local: {local_zip_path}")
+            self.log(f"   📅 Date (mtime): {file_date}")
+            self.log(f"   📁 Zipped: {local_zip_path}")
 
             try:
                 # Download the file
                 self.sftp.get(fname, local_zip_path)
                 self.log(f"✅ Downloaded to {local_zip_path}")
 
-                # ============================================================
-                # CLEAN UP ANY OLD DUPLICATES AFTER DOWNLOAD
-                # ============================================================
-                self.cleanup_old_duplicates(zipped_folder, base_name, '.zip')
+                # Clean up duplicates in zipped folder
+                self.cleanup_old_zipped_duplicates(zipped_folder, base_name)
 
                 # ============================================================
-                # UNZIP THE FILE
+                # STEP 7: Unzip the file
                 # ============================================================
                 self.log(f"📂 Unzipping {local_zip_path}...")
                 self._unzip_file(local_zip_path, unzipped_folder)
 
-                # Clean up old CSV duplicates in unzipped folder
-                self.cleanup_old_duplicates(unzipped_folder, base_name, '.csv')
+                # ============================================================
+                # STEP 8: Clean up duplicate CSVs (keep one per technology)
+                # ============================================================
+                self.cleanup_old_csv_duplicates(unzipped_folder, base_name)
 
                 processed_count += 1
                 self.log(f"✅ Done: {fname}")
 
             except Exception as e:
                 self.log(f"❌ Failed to download/unzip {fname}: {e}", 'error')
+                error_count += 1
                 continue
 
-        self.log(f"\n📊 Download Summary:")
+        # ============================================================
+        # SUMMARY
+        # ============================================================
+        self.log(f"\n{'=' * 50}")
+        self.log(f"📊 DOWNLOAD SUMMARY")
+        self.log(f"{'=' * 50}")
         self.log(f"   ✅ Downloaded: {processed_count} files")
         self.log(f"   ⏭️ Skipped: {skipped_count} files")
+        self.log(f"   ❌ Errors: {error_count} files")
         self.log(f"   📁 Local root: {self.local_root}")
+        self.log(f"{'=' * 50}")
+
         return True
 
     def _unzip_file(self, zip_path, extract_to):
